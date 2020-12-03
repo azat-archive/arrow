@@ -27,7 +27,7 @@ use super::{RecordBatchStream, SendableRecordBatchStream};
 use crate::error::{DataFusionError, Result};
 use crate::physical_plan::{ExecutionPlan, Partitioning, PhysicalExpr};
 use arrow::array::BooleanArray;
-use arrow::compute::filter;
+use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
@@ -54,7 +54,7 @@ impl FilterExec {
     ) -> Result<Self> {
         match predicate.data_type(input.schema().as_ref())? {
             DataType::Boolean => Ok(Self {
-                predicate: predicate.clone(),
+                predicate,
                 input: input.clone(),
             }),
             other => Err(DataFusionError::Plan(format!(
@@ -128,6 +128,7 @@ fn batch_filter(
 ) -> ArrowResult<RecordBatch> {
     predicate
         .evaluate(&batch)
+        .map(|v| v.into_array(batch.num_rows()))
         .map_err(DataFusionError::into_arrow_external_error)
         .and_then(|array| {
             array
@@ -139,17 +140,9 @@ fn batch_filter(
                     )
                     .into_arrow_external_error(),
                 )
-                // apply predicate to each column
-                .and_then(|predicate| {
-                    batch
-                        .columns()
-                        .iter()
-                        .map(|column| filter(column.as_ref(), predicate))
-                        .collect::<ArrowResult<Vec<_>>>()
-                })
+                // apply filter array to record batch
+                .and_then(|filter_array| filter_record_batch(batch, filter_array))
         })
-        // build RecordBatch
-        .and_then(|columns| RecordBatch::try_new(batch.schema().clone(), columns))
 }
 
 impl Stream for FilterExecStream {

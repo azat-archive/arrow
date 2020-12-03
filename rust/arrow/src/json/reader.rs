@@ -44,16 +44,17 @@
 
 use indexmap::map::IndexMap as HashMap;
 use indexmap::set::IndexSet as HashSet;
-use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::array::*;
+use crate::buffer::MutableBuffer;
 use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
 use crate::record_batch::RecordBatch;
+use crate::util::bit_util;
 
 /// Coerce data type during inference
 ///
@@ -263,125 +264,122 @@ pub fn infer_json_schema<R: Read>(
 
         match record {
             Value::Object(map) => {
-                let res = map
-                    .iter()
-                    .map(|(k, v)| {
-                        match v {
-                            Value::Array(a) => {
-                                // collect the data types in array
-                                let types: Result<Vec<Option<&DataType>>> = a
-                                    .iter()
-                                    .map(|a| match a {
-                                        Value::Null => Ok(None),
-                                        Value::Number(n) => {
-                                            if n.is_i64() {
-                                                Ok(Some(&DataType::Int64))
-                                            } else {
-                                                Ok(Some(&DataType::Float64))
-                                            }
+                let res = map.iter().try_for_each(|(k, v)| {
+                    match v {
+                        Value::Array(a) => {
+                            // collect the data types in array
+                            let types: Result<Vec<Option<&DataType>>> = a
+                                .iter()
+                                .map(|a| match a {
+                                    Value::Null => Ok(None),
+                                    Value::Number(n) => {
+                                        if n.is_i64() {
+                                            Ok(Some(&DataType::Int64))
+                                        } else {
+                                            Ok(Some(&DataType::Float64))
                                         }
-                                        Value::Bool(_) => Ok(Some(&DataType::Boolean)),
-                                        Value::String(_) => Ok(Some(&DataType::Utf8)),
-                                        Value::Array(_) | Value::Object(_) => {
-                                            Err(ArrowError::JsonError(
-                                                "Nested lists and structs not supported"
-                                                    .to_string(),
-                                            ))
-                                        }
-                                    })
-                                    .collect();
-                                match types {
-                                    Ok(types) => {
-                                        // unwrap the Option and discard None values (from
-                                        // JSON nulls)
-                                        let mut types: Vec<&DataType> =
-                                            types.into_iter().filter_map(|t| t).collect();
-                                        types.dedup();
-                                        // if a record contains only nulls, it is not
-                                        // added to values
-                                        if !types.is_empty() {
-                                            let dt = coerce_data_type(types)?;
+                                    }
+                                    Value::Bool(_) => Ok(Some(&DataType::Boolean)),
+                                    Value::String(_) => Ok(Some(&DataType::Utf8)),
+                                    Value::Array(_) | Value::Object(_) => {
+                                        Err(ArrowError::JsonError(
+                                            "Nested lists and structs not supported"
+                                                .to_string(),
+                                        ))
+                                    }
+                                })
+                                .collect();
+                            match types {
+                                Ok(types) => {
+                                    // unwrap the Option and discard None values (from
+                                    // JSON nulls)
+                                    let mut types: Vec<&DataType> =
+                                        types.into_iter().filter_map(|t| t).collect();
+                                    types.dedup();
+                                    // if a record contains only nulls, it is not
+                                    // added to values
+                                    if !types.is_empty() {
+                                        let dt = coerce_data_type(types)?;
 
-                                            if values.contains_key(k) {
-                                                let x = values.get_mut(k).unwrap();
-                                                x.insert(DataType::List(Box::new(
-                                                    Field::new("item", dt, true),
-                                                )));
-                                            } else {
-                                                // create hashset and add value type
-                                                let mut hs = HashSet::new();
-                                                hs.insert(DataType::List(Box::new(
-                                                    Field::new("item", dt, true),
-                                                )));
-                                                values.insert(k.to_string(), hs);
-                                            }
+                                        if values.contains_key(k) {
+                                            let x = values.get_mut(k).unwrap();
+                                            x.insert(DataType::List(Box::new(
+                                                Field::new("item", dt, true),
+                                            )));
+                                        } else {
+                                            // create hashset and add value type
+                                            let mut hs = HashSet::new();
+                                            hs.insert(DataType::List(Box::new(
+                                                Field::new("item", dt, true),
+                                            )));
+                                            values.insert(k.to_string(), hs);
                                         }
-                                        Ok(())
                                     }
-                                    Err(e) => Err(e),
+                                    Ok(())
                                 }
+                                Err(e) => Err(e),
                             }
-                            Value::Bool(_) => {
-                                if values.contains_key(k) {
-                                    let x = values.get_mut(k).unwrap();
-                                    x.insert(DataType::Boolean);
-                                } else {
-                                    // create hashset and add value type
-                                    let mut hs = HashSet::new();
-                                    hs.insert(DataType::Boolean);
-                                    values.insert(k.to_string(), hs);
-                                }
-                                Ok(())
-                            }
-                            Value::Null => {
-                                // do nothing, we treat json as nullable by default when
-                                // inferring
-                                Ok(())
-                            }
-                            Value::Number(n) => {
-                                if n.is_f64() {
-                                    if values.contains_key(k) {
-                                        let x = values.get_mut(k).unwrap();
-                                        x.insert(DataType::Float64);
-                                    } else {
-                                        // create hashset and add value type
-                                        let mut hs = HashSet::new();
-                                        hs.insert(DataType::Float64);
-                                        values.insert(k.to_string(), hs);
-                                    }
-                                } else {
-                                    // default to i64
-                                    if values.contains_key(k) {
-                                        let x = values.get_mut(k).unwrap();
-                                        x.insert(DataType::Int64);
-                                    } else {
-                                        // create hashset and add value type
-                                        let mut hs = HashSet::new();
-                                        hs.insert(DataType::Int64);
-                                        values.insert(k.to_string(), hs);
-                                    }
-                                }
-                                Ok(())
-                            }
-                            Value::String(_) => {
-                                if values.contains_key(k) {
-                                    let x = values.get_mut(k).unwrap();
-                                    x.insert(DataType::Utf8);
-                                } else {
-                                    // create hashset and add value type
-                                    let mut hs = HashSet::new();
-                                    hs.insert(DataType::Utf8);
-                                    values.insert(k.to_string(), hs);
-                                }
-                                Ok(())
-                            }
-                            Value::Object(_) => Err(ArrowError::JsonError(
-                                "Reading nested JSON structs currently not supported"
-                                    .to_string(),
-                            )),
                         }
-                    })
-                    .collect();
+                        Value::Bool(_) => {
+                            if values.contains_key(k) {
+                                let x = values.get_mut(k).unwrap();
+                                x.insert(DataType::Boolean);
+                            } else {
+                                // create hashset and add value type
+                                let mut hs = HashSet::new();
+                                hs.insert(DataType::Boolean);
+                                values.insert(k.to_string(), hs);
+                            }
+                            Ok(())
+                        }
+                        Value::Null => {
+                            // do nothing, we treat json as nullable by default when
+                            // inferring
+                            Ok(())
+                        }
+                        Value::Number(n) => {
+                            if n.is_f64() {
+                                if values.contains_key(k) {
+                                    let x = values.get_mut(k).unwrap();
+                                    x.insert(DataType::Float64);
+                                } else {
+                                    // create hashset and add value type
+                                    let mut hs = HashSet::new();
+                                    hs.insert(DataType::Float64);
+                                    values.insert(k.to_string(), hs);
+                                }
+                            } else {
+                                // default to i64
+                                if values.contains_key(k) {
+                                    let x = values.get_mut(k).unwrap();
+                                    x.insert(DataType::Int64);
+                                } else {
+                                    // create hashset and add value type
+                                    let mut hs = HashSet::new();
+                                    hs.insert(DataType::Int64);
+                                    values.insert(k.to_string(), hs);
+                                }
+                            }
+                            Ok(())
+                        }
+                        Value::String(_) => {
+                            if values.contains_key(k) {
+                                let x = values.get_mut(k).unwrap();
+                                x.insert(DataType::Utf8);
+                            } else {
+                                // create hashset and add value type
+                                let mut hs = HashSet::new();
+                                hs.insert(DataType::Utf8);
+                                values.insert(k.to_string(), hs);
+                            }
+                            Ok(())
+                        }
+                        Value::Object(_) => Err(ArrowError::JsonError(
+                            "Inferring schema from nested JSON structs currently not supported"
+                                .to_string(),
+                        )),
+                    }
+                });
                 match res {
                     Ok(()) => {}
                     Err(e) => return Err(e),
@@ -488,185 +486,7 @@ impl<R: Read> Reader<R> {
 
         let rows = &rows[..];
         let projection = self.projection.clone().unwrap_or_else(Vec::new);
-        let arrays: Result<Vec<ArrayRef>> =
-            self.schema
-                .clone()
-                .fields()
-                .iter()
-                .filter(|field| {
-                    if projection.is_empty() {
-                        return true;
-                    }
-                    projection.contains(field.name())
-                })
-                .map(|field| {
-                    match field.data_type().clone() {
-                        DataType::Null => unimplemented!(),
-                        DataType::Boolean => self.build_boolean_array(rows, field.name()),
-                        DataType::Float64 => {
-                            self.build_primitive_array::<Float64Type>(rows, field.name())
-                        }
-                        DataType::Float32 => {
-                            self.build_primitive_array::<Float32Type>(rows, field.name())
-                        }
-                        DataType::Int64 => {
-                            self.build_primitive_array::<Int64Type>(rows, field.name())
-                        }
-                        DataType::Int32 => {
-                            self.build_primitive_array::<Int32Type>(rows, field.name())
-                        }
-                        DataType::Int16 => {
-                            self.build_primitive_array::<Int16Type>(rows, field.name())
-                        }
-                        DataType::Int8 => {
-                            self.build_primitive_array::<Int8Type>(rows, field.name())
-                        }
-                        DataType::UInt64 => {
-                            self.build_primitive_array::<UInt64Type>(rows, field.name())
-                        }
-                        DataType::UInt32 => {
-                            self.build_primitive_array::<UInt32Type>(rows, field.name())
-                        }
-                        DataType::UInt16 => {
-                            self.build_primitive_array::<UInt16Type>(rows, field.name())
-                        }
-                        DataType::UInt8 => {
-                            self.build_primitive_array::<UInt8Type>(rows, field.name())
-                        }
-                        DataType::Timestamp(unit, _) => match unit {
-                            TimeUnit::Second => self
-                                .build_primitive_array::<TimestampSecondType>(
-                                    rows,
-                                    field.name(),
-                                ),
-                            TimeUnit::Microsecond => self
-                                .build_primitive_array::<TimestampMicrosecondType>(
-                                    rows,
-                                    field.name(),
-                                ),
-                            TimeUnit::Millisecond => self
-                                .build_primitive_array::<TimestampMillisecondType>(
-                                    rows,
-                                    field.name(),
-                                ),
-                            TimeUnit::Nanosecond => self
-                                .build_primitive_array::<TimestampNanosecondType>(
-                                    rows,
-                                    field.name(),
-                                ),
-                        },
-                        DataType::Date64(_) => {
-                            self.build_primitive_array::<Date64Type>(rows, field.name())
-                        }
-                        DataType::Date32(_) => {
-                            self.build_primitive_array::<Date32Type>(rows, field.name())
-                        }
-                        DataType::Time64(unit) => match unit {
-                            TimeUnit::Microsecond => self
-                                .build_primitive_array::<Time64MicrosecondType>(
-                                    rows,
-                                    field.name(),
-                                ),
-                            TimeUnit::Nanosecond => self
-                                .build_primitive_array::<Time64NanosecondType>(
-                                    rows,
-                                    field.name(),
-                                ),
-                            _ => unimplemented!(),
-                        },
-                        DataType::Time32(unit) => match unit {
-                            TimeUnit::Second => self
-                                .build_primitive_array::<Time32SecondType>(
-                                    rows,
-                                    field.name(),
-                                ),
-                            TimeUnit::Millisecond => self
-                                .build_primitive_array::<Time32MillisecondType>(
-                                    rows,
-                                    field.name(),
-                                ),
-                            _ => unimplemented!(),
-                        },
-                        DataType::Utf8 => {
-                            let mut builder = StringBuilder::new(rows.len());
-                            for row in rows {
-                                if let Some(value) = row.get(field.name()) {
-                                    if let Some(str_v) = value.as_str() {
-                                        builder.append_value(str_v)?
-                                    } else {
-                                        builder.append(false)?
-                                    }
-                                } else {
-                                    builder.append(false)?
-                                }
-                            }
-                            Ok(Arc::new(builder.finish()) as ArrayRef)
-                        }
-                        DataType::List(ref t) => {
-                            match t.data_type() {
-                                DataType::Int8 => {
-                                    self.build_list_array::<Int8Type>(rows, field.name())
-                                }
-                                DataType::Int16 => {
-                                    self.build_list_array::<Int16Type>(rows, field.name())
-                                }
-                                DataType::Int32 => {
-                                    self.build_list_array::<Int32Type>(rows, field.name())
-                                }
-                                DataType::Int64 => {
-                                    self.build_list_array::<Int64Type>(rows, field.name())
-                                }
-                                DataType::UInt8 => {
-                                    self.build_list_array::<UInt8Type>(rows, field.name())
-                                }
-                                DataType::UInt16 => self
-                                    .build_list_array::<UInt16Type>(rows, field.name()),
-                                DataType::UInt32 => self
-                                    .build_list_array::<UInt32Type>(rows, field.name()),
-                                DataType::UInt64 => self
-                                    .build_list_array::<UInt64Type>(rows, field.name()),
-                                DataType::Float32 => self
-                                    .build_list_array::<Float32Type>(rows, field.name()),
-                                DataType::Float64 => self
-                                    .build_list_array::<Float64Type>(rows, field.name()),
-                                DataType::Null => unimplemented!(),
-                                DataType::Boolean => {
-                                    self.build_boolean_list_array(rows, field.name())
-                                }
-                                ref dtype @ DataType::Utf8 => {
-                                    // UInt64Type passed down below is a fake type for dictionary builder.
-                                    // It is there to make compiler happy.
-                                    self.list_array_string_array_builder::<UInt64Type>(
-                                        &dtype,
-                                        field.name(),
-                                        rows,
-                                    )
-                                }
-                                DataType::Dictionary(ref key_ty, _) => self
-                                    .build_wrapped_list_array(rows, field.name(), key_ty),
-                                ref e => Err(ArrowError::JsonError(format!(
-                            "Data type is currently not supported in a list : {:?}",
-                            e
-                        ))),
-                            }
-                        }
-                        DataType::Dictionary(ref key_ty, ref val_ty) => self
-                            .build_string_dictionary_array(
-                                rows,
-                                field.name(),
-                                key_ty,
-                                val_ty,
-                            ),
-                        DataType::Struct(_) => Err(ArrowError::JsonError(
-                            "struct types are not yet supported".to_string(),
-                        )),
-                        _ => Err(ArrowError::JsonError(format!(
-                            "{:?} type is not supported",
-                            field.data_type()
-                        ))),
-                    }
-                })
-                .collect();
+        let arrays = self.build_struct_array(rows, self.schema.fields(), &projection);
 
         let projected_fields: Vec<Field> = if projection.is_empty() {
             self.schema.fields().to_vec()
@@ -764,15 +584,15 @@ impl<R: Read> Reader<R> {
     where
         DICT_TY: ArrowPrimitiveType + ArrowDictionaryKeyType,
     {
-        let mut builder: RefCell<Box<dyn ArrayBuilder>> = match data_type {
+        let mut builder: Box<dyn ArrayBuilder> = match data_type {
             DataType::Utf8 => {
                 let values_builder = StringBuilder::new(rows.len() * 5);
-                RefCell::new(Box::new(ListBuilder::new(values_builder)))
+                Box::new(ListBuilder::new(values_builder))
             }
             DataType::Dictionary(_, _) => {
                 let values_builder =
                     self.build_string_dictionary_builder::<DICT_TY>(rows.len() * 5)?;
-                RefCell::new(Box::new(ListBuilder::new(values_builder)))
+                Box::new(ListBuilder::new(values_builder))
             }
             e => {
                 return Err(ArrowError::JsonError(format!(
@@ -815,11 +635,10 @@ impl<R: Read> Reader<R> {
                 // them.
                 match data_type {
                     DataType::Utf8 => {
-                        let builder = &mut builder.borrow_mut();
                         let builder = builder
                             .as_any_mut()
                             .downcast_mut::<ListBuilder<StringBuilder>>()
-                            .ok_or(ArrowError::JsonError(
+                            .ok_or_else(||ArrowError::JsonError(
                                 "Cast failed for ListBuilder<StringBuilder> during nested data parsing".to_string(),
                             ))?;
                         for val in vals {
@@ -834,8 +653,7 @@ impl<R: Read> Reader<R> {
                         builder.append(true)?;
                     }
                     DataType::Dictionary(_, _) => {
-                        let builder = &mut builder.borrow_mut();
-                        let builder = builder.as_any_mut().downcast_mut::<ListBuilder<StringDictionaryBuilder<DICT_TY>>>().ok_or(ArrowError::JsonError(
+                        let builder = builder.as_any_mut().downcast_mut::<ListBuilder<StringDictionaryBuilder<DICT_TY>>>().ok_or_else(||ArrowError::JsonError(
                             "Cast failed for ListBuilder<StringDictionaryBuilder> during nested data parsing".to_string(),
                         ))?;
                         for val in vals {
@@ -859,7 +677,7 @@ impl<R: Read> Reader<R> {
             }
         }
 
-        Ok(builder.get_mut().finish() as ArrayRef)
+        Ok(builder.finish() as ArrayRef)
     }
 
     #[inline(always)]
@@ -1028,6 +846,228 @@ impl<R: Read> Reader<R> {
         Ok(Arc::new(builder.finish()))
     }
 
+    fn build_struct_array(
+        &self,
+        rows: &[Value],
+        struct_fields: &[Field],
+        projection: &[String],
+    ) -> Result<Vec<ArrayRef>> {
+        let arrays: Result<Vec<ArrayRef>> =
+            struct_fields
+                .iter()
+                .filter(|field| {
+                    if projection.is_empty() {
+                        return true;
+                    }
+                    projection.contains(field.name())
+                })
+                .map(|field| {
+                    match field.data_type() {
+                        DataType::Null => unimplemented!(),
+                        DataType::Boolean => self.build_boolean_array(rows, field.name()),
+                        DataType::Float64 => {
+                            self.build_primitive_array::<Float64Type>(rows, field.name())
+                        }
+                        DataType::Float32 => {
+                            self.build_primitive_array::<Float32Type>(rows, field.name())
+                        }
+                        DataType::Int64 => {
+                            self.build_primitive_array::<Int64Type>(rows, field.name())
+                        }
+                        DataType::Int32 => {
+                            self.build_primitive_array::<Int32Type>(rows, field.name())
+                        }
+                        DataType::Int16 => {
+                            self.build_primitive_array::<Int16Type>(rows, field.name())
+                        }
+                        DataType::Int8 => {
+                            self.build_primitive_array::<Int8Type>(rows, field.name())
+                        }
+                        DataType::UInt64 => {
+                            self.build_primitive_array::<UInt64Type>(rows, field.name())
+                        }
+                        DataType::UInt32 => {
+                            self.build_primitive_array::<UInt32Type>(rows, field.name())
+                        }
+                        DataType::UInt16 => {
+                            self.build_primitive_array::<UInt16Type>(rows, field.name())
+                        }
+                        DataType::UInt8 => {
+                            self.build_primitive_array::<UInt8Type>(rows, field.name())
+                        }
+                        DataType::Timestamp(unit, _) => match unit {
+                            TimeUnit::Second => self
+                                .build_primitive_array::<TimestampSecondType>(
+                                    rows,
+                                    field.name(),
+                                ),
+                            TimeUnit::Microsecond => self
+                                .build_primitive_array::<TimestampMicrosecondType>(
+                                    rows,
+                                    field.name(),
+                                ),
+                            TimeUnit::Millisecond => self
+                                .build_primitive_array::<TimestampMillisecondType>(
+                                    rows,
+                                    field.name(),
+                                ),
+                            TimeUnit::Nanosecond => self
+                                .build_primitive_array::<TimestampNanosecondType>(
+                                    rows,
+                                    field.name(),
+                                ),
+                        },
+                        DataType::Date64(_) => {
+                            self.build_primitive_array::<Date64Type>(rows, field.name())
+                        }
+                        DataType::Date32(_) => {
+                            self.build_primitive_array::<Date32Type>(rows, field.name())
+                        }
+                        DataType::Time64(unit) => match unit {
+                            TimeUnit::Microsecond => self
+                                .build_primitive_array::<Time64MicrosecondType>(
+                                    rows,
+                                    field.name(),
+                                ),
+                            TimeUnit::Nanosecond => self
+                                .build_primitive_array::<Time64NanosecondType>(
+                                    rows,
+                                    field.name(),
+                                ),
+                            _ => unimplemented!(),
+                        },
+                        DataType::Time32(unit) => match unit {
+                            TimeUnit::Second => self
+                                .build_primitive_array::<Time32SecondType>(
+                                    rows,
+                                    field.name(),
+                                ),
+                            TimeUnit::Millisecond => self
+                                .build_primitive_array::<Time32MillisecondType>(
+                                    rows,
+                                    field.name(),
+                                ),
+                            _ => unimplemented!(),
+                        },
+                        DataType::Utf8 => {
+                            let mut builder = StringBuilder::new(rows.len());
+                            for row in rows {
+                                if let Some(value) = row.get(field.name()) {
+                                    if let Some(str_v) = value.as_str() {
+                                        builder.append_value(str_v)?
+                                    } else {
+                                        builder.append(false)?
+                                    }
+                                } else {
+                                    builder.append(false)?
+                                }
+                            }
+                            Ok(Arc::new(builder.finish()) as ArrayRef)
+                        }
+                        DataType::List(ref t) => {
+                            match t.data_type() {
+                                DataType::Int8 => {
+                                    self.build_list_array::<Int8Type>(rows, field.name())
+                                }
+                                DataType::Int16 => {
+                                    self.build_list_array::<Int16Type>(rows, field.name())
+                                }
+                                DataType::Int32 => {
+                                    self.build_list_array::<Int32Type>(rows, field.name())
+                                }
+                                DataType::Int64 => {
+                                    self.build_list_array::<Int64Type>(rows, field.name())
+                                }
+                                DataType::UInt8 => {
+                                    self.build_list_array::<UInt8Type>(rows, field.name())
+                                }
+                                DataType::UInt16 => self
+                                    .build_list_array::<UInt16Type>(rows, field.name()),
+                                DataType::UInt32 => self
+                                    .build_list_array::<UInt32Type>(rows, field.name()),
+                                DataType::UInt64 => self
+                                    .build_list_array::<UInt64Type>(rows, field.name()),
+                                DataType::Float32 => self
+                                    .build_list_array::<Float32Type>(rows, field.name()),
+                                DataType::Float64 => self
+                                    .build_list_array::<Float64Type>(rows, field.name()),
+                                DataType::Null => unimplemented!(),
+                                DataType::Boolean => {
+                                    self.build_boolean_list_array(rows, field.name())
+                                }
+                                ref dtype @ DataType::Utf8 => {
+                                    // UInt64Type passed down below is a fake type for dictionary builder.
+                                    // It is there to make compiler happy.
+                                    self.list_array_string_array_builder::<UInt64Type>(
+                                        &dtype,
+                                        field.name(),
+                                        rows,
+                                    )
+                                }
+                                DataType::Dictionary(ref key_ty, _) => self
+                                    .build_wrapped_list_array(rows, field.name(), key_ty),
+                                ref e => Err(ArrowError::JsonError(format!(
+                            "Data type is currently not supported in a list : {:?}",
+                            e
+                        ))),
+                            }
+                        }
+                        DataType::Dictionary(ref key_ty, ref val_ty) => self
+                            .build_string_dictionary_array(
+                                rows,
+                                field.name(),
+                                key_ty,
+                                val_ty,
+                            ),
+                        DataType::Struct(fields) => {
+                            // TODO: add a check limiting recursion
+                            let len = rows.len();
+                            let num_bytes = bit_util::ceil(len, 8);
+                            let mut null_buffer = MutableBuffer::new(num_bytes)
+                                .with_bitset(num_bytes, false);
+                            let struct_rows = rows
+                                .iter()
+                                .enumerate()
+                                .map(|(i, row)| {
+                                    (
+                                        i,
+                                        row.as_object()
+                                            .map(|v| v.get(field.name()))
+                                            .flatten(),
+                                    )
+                                })
+                                .map(|(i, v)| match v {
+                                    // we want the field as an object, if it's not, we treat as null
+                                    Some(Value::Object(value)) => {
+                                        bit_util::set_bit(null_buffer.data_mut(), i);
+                                        Value::Object(value.clone())
+                                    }
+                                    _ => Value::Object(Default::default()),
+                                })
+                                .collect::<Vec<Value>>();
+                            let arrays =
+                                self.build_struct_array(&struct_rows, fields, &[])?;
+                            // construct a struct array's data in order to set null buffer
+                            let data_type = DataType::Struct(fields.clone());
+                            let data = ArrayDataBuilder::new(data_type)
+                                .len(len)
+                                .null_bit_buffer(null_buffer.freeze())
+                                .child_data(
+                                    arrays.into_iter().map(|a| a.data()).collect(),
+                                )
+                                .build();
+                            Ok(make_array(data))
+                        }
+                        _ => Err(ArrowError::JsonError(format!(
+                            "{:?} type is not supported",
+                            field.data_type()
+                        ))),
+                    }
+                })
+                .collect();
+        arrays
+    }
+
     #[inline(always)]
     fn build_dictionary_array<T>(
         &self,
@@ -1161,7 +1201,10 @@ impl ReaderBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::datatypes::DataType::{Dictionary, List};
+    use crate::{
+        buffer::Buffer,
+        datatypes::DataType::{Dictionary, List},
+    };
 
     use super::*;
     use flate2::read::GzDecoder;
@@ -1563,6 +1606,54 @@ mod tests {
             assert_eq!("array", dd.value(5));
             assert_eq!("2.4", dd.value(6));
         }
+    }
+
+    #[test]
+    fn test_nested_struct_json_arrays() {
+        let c_field = Field::new(
+            "c",
+            DataType::Struct(vec![Field::new("d", DataType::Utf8, true)]),
+            true,
+        );
+        let a_field = Field::new(
+            "a",
+            DataType::Struct(vec![
+                Field::new("b", DataType::Boolean, true),
+                c_field.clone(),
+            ]),
+            true,
+        );
+        let schema = Arc::new(Schema::new(vec![a_field.clone()]));
+        let builder = ReaderBuilder::new().with_schema(schema).with_batch_size(64);
+        let mut reader: Reader<File> = builder
+            .build::<File>(File::open("test/data/nested_structs.json").unwrap())
+            .unwrap();
+
+        // build expected output
+        let d = StringArray::from(vec![Some("text"), None, Some("text"), None]);
+        let c = ArrayDataBuilder::new(c_field.data_type().clone())
+            .null_count(2)
+            .len(4)
+            .add_child_data(d.data())
+            .null_bit_buffer(Buffer::from(vec![0b00000101]))
+            .build();
+        let b = BooleanArray::from(vec![Some(true), Some(false), Some(true), None]);
+        let a = ArrayDataBuilder::new(a_field.data_type().clone())
+            .null_count(1)
+            .len(4)
+            .add_child_data(b.data())
+            .add_child_data(c)
+            .null_bit_buffer(Buffer::from(vec![0b00000111]))
+            .build();
+        let expected = make_array(a);
+
+        // compare `a` with result from json reader
+        let batch = reader.next().unwrap().unwrap();
+        let read = batch.column(0);
+        assert!(
+            expected.data_ref() == read.data_ref(),
+            format!("{:?} != {:?}", expected.data(), read.data())
+        );
     }
 
     #[test]

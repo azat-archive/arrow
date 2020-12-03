@@ -58,6 +58,8 @@ DataFusion includes a simple command-line interactive SQL utility. See the [CLI 
 - String functions
   - [x] Length
   - [x] Concatenate
+- Miscellaneous/Boolean functions
+  - [x] nullif
 - Common date/time functions
   - [ ] Basic date functions
   - [ ] Basic time functions
@@ -67,7 +69,7 @@ DataFusion includes a simple command-line interactive SQL utility. See the [CLI 
 - [x] Sorting
 - [ ] Nested types
 - [ ] Lists
-- [ ] Subqueries
+- [x] Subqueries
 - [ ] Joins
 
 ## Data Sources
@@ -171,3 +173,24 @@ Below is a checklist of what you need to do to add a new aggregate function to D
   * a new line in `create_aggregate_expr` mapping the built-in to the implementation
   * tests to the function.
 * In [tests/sql.rs](tests/sql.rs), add a new test where the function is called through SQL against well known data and returns the expected result.
+
+## How to display plans graphically
+
+The query plans represented by `LogicalPlan` nodes can be graphically
+rendered using [Graphviz](http://www.graphviz.org/).
+
+To do so, save the output of the `display_graphviz` function to a file.:
+
+```rust
+// Create plan somehow...
+let mut output = File::create("/tmp/plan.dot")?;
+write!(output, "{}", plan.display_graphviz());
+```
+
+Then, use the `dot` command line tool to render it into a file that
+can be displayed. For example, the following command creates a
+`/tmp/plan.pdf` file:
+
+```bash
+dot -Tpdf < /tmp/plan.dot > /tmp/plan.pdf
+```

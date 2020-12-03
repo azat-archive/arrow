@@ -115,14 +115,17 @@ static std::shared_ptr<Statistics> MakeTypedColumnStats(
         descr, metadata.statistics.min_value, metadata.statistics.max_value,
         metadata.num_values - metadata.statistics.null_count,
         metadata.statistics.null_count, metadata.statistics.distinct_count,
-        metadata.statistics.__isset.max_value || metadata.statistics.__isset.min_value);
+        metadata.statistics.__isset.max_value || metadata.statistics.__isset.min_value,
+        metadata.statistics.__isset.null_count,
+        metadata.statistics.__isset.distinct_count);
   }
   // Default behavior
   return MakeStatistics<DType>(
       descr, metadata.statistics.min, metadata.statistics.max,
       metadata.num_values - metadata.statistics.null_count,
       metadata.statistics.null_count, metadata.statistics.distinct_count,
-      metadata.statistics.__isset.max || metadata.statistics.__isset.min);
+      metadata.statistics.__isset.max || metadata.statistics.__isset.min,
+      metadata.statistics.__isset.null_count, metadata.statistics.__isset.distinct_count);
 }
 
 std::shared_ptr<Statistics> MakeColumnStats(const format::ColumnMetaData& meta_data,
@@ -936,7 +939,7 @@ void FileCryptoMetaData::WriteTo(::arrow::io::OutputStream* dst) const {
 std::string FileMetaData::SerializeToString() const {
   // We need to pass in an initial size. Since it will automatically
   // increase the buffer size to hold the metadata, we just leave it 0.
-  PARQUET_ASSIGN_OR_THROW(auto serializer, arrow::io::BufferOutputStream::Create(0));
+  PARQUET_ASSIGN_OR_THROW(auto serializer, ::arrow::io::BufferOutputStream::Create(0));
   WriteTo(serializer.get());
   PARQUET_ASSIGN_OR_THROW(auto metadata_buffer, serializer->Finish());
   return metadata_buffer->ToString();

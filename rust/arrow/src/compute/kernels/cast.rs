@@ -70,6 +70,8 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
 
         (_, Boolean) => DataType::is_numeric(from_type),
         (Boolean, _) => DataType::is_numeric(to_type) || to_type == &Utf8,
+
+        (Utf8, Date32(DateUnit::Day)) => true,
         (Utf8, _) => DataType::is_numeric(to_type),
         (_, Utf8) => DataType::is_numeric(from_type) || from_type == &Binary,
 
@@ -191,17 +193,16 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
         (Time32(_), Time64(_)) => true,
         (Time64(TimeUnit::Microsecond), Time64(TimeUnit::Nanosecond)) => true,
         (Time64(TimeUnit::Nanosecond), Time64(TimeUnit::Microsecond)) => true,
-        (Time64(_), Time32(to_unit)) => match to_unit {
-            TimeUnit::Second => true,
-            TimeUnit::Millisecond => true,
-            _ => false,
-        },
+        (Time64(_), Time32(to_unit)) => {
+            matches!(to_unit, TimeUnit::Second | TimeUnit::Millisecond)
+        }
         (Timestamp(_, _), Int64) => true,
         (Int64, Timestamp(_, _)) => true,
         (Timestamp(_, _), Timestamp(_, _)) => true,
         (Timestamp(_, _), Date32(_)) => true,
         (Timestamp(_, _), Date64(_)) => true,
         // date64 to timestamp might not make sense,
+        (Int64, Duration(_)) => true,
         (Null, Int32) => true,
         (_, _) => false,
     }
@@ -377,6 +378,27 @@ pub fn cast(array: &ArrayRef, to_type: &DataType) -> Result<ArrayRef> {
             Int64 => cast_string_to_numeric::<Int64Type>(array),
             Float32 => cast_string_to_numeric::<Float32Type>(array),
             Float64 => cast_string_to_numeric::<Float64Type>(array),
+            Date32(DateUnit::Day) => {
+                use chrono::{NaiveDate, NaiveTime};
+                let zero_time = NaiveTime::from_hms(0, 0, 0);
+                let string_array = array.as_any().downcast_ref::<StringArray>().unwrap();
+                let mut builder = PrimitiveBuilder::<Date32Type>::new(string_array.len());
+                for i in 0..string_array.len() {
+                    if string_array.is_null(i) {
+                        builder.append_null()?;
+                    } else {
+                        match NaiveDate::parse_from_str(string_array.value(i), "%Y-%m-%d")
+                        {
+                            Ok(date) => builder.append_value(
+                                (date.and_time(zero_time).timestamp() / SECONDS_IN_DAY)
+                                    as i32,
+                            )?,
+                            Err(_) => builder.append_null()?, // not a valid date
+                        };
+                    }
+                }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            }
             _ => Err(ArrowError::ComputeError(format!(
                 "Casting from {:?} to {:?} not supported",
                 from_type, to_type,
@@ -751,6 +773,21 @@ pub fn cast(array: &ArrayRef, to_type: &DataType) -> Result<ArrayRef> {
             }
         }
         // date64 to timestamp might not make sense,
+        (Int64, Duration(to_unit)) => {
+            use TimeUnit::*;
+            match to_unit {
+                Second => cast_array_data::<DurationSecondType>(array, to_type.clone()),
+                Millisecond => {
+                    cast_array_data::<DurationMillisecondType>(array, to_type.clone())
+                }
+                Microsecond => {
+                    cast_array_data::<DurationMicrosecondType>(array, to_type.clone())
+                }
+                Nanosecond => {
+                    cast_array_data::<DurationNanosecondType>(array, to_type.clone())
+                }
+            }
+        }
 
         // null to primitive/flat types
         (Null, Int32) => Ok(Arc::new(Int32Array::from(vec![None; array.len()]))),
@@ -2707,6 +2744,43 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_utf8_to_date32() {
+        use chrono::{NaiveDate, NaiveTime};
+
+        let a = StringArray::from(vec![
+            "2000-01-01",          // valid date with leading 0s
+            "2000-2-2",            // valid date without leading 0s
+            "2000-00-00",          // invalid month and day
+            "2000-01-01T12:00:00", // date + time is invalid
+            "2000",                // just a year is invalid
+        ]);
+        let array = Arc::new(a) as ArrayRef;
+        let b = cast(&array, &DataType::Date32(DateUnit::Day)).unwrap();
+        let c = b.as_any().downcast_ref::<Date32Array>().unwrap();
+
+        let zero_time = NaiveTime::from_hms(0, 0, 0);
+        // test valid inputs
+        let date_value = (NaiveDate::from_ymd(2000, 1, 1)
+            .and_time(zero_time)
+            .timestamp()
+            / SECONDS_IN_DAY) as i32;
+        assert_eq!(true, c.is_valid(0)); // "2000-01-01"
+        assert_eq!(date_value, c.value(0));
+
+        let date_value = (NaiveDate::from_ymd(2000, 2, 2)
+            .and_time(zero_time)
+            .timestamp()
+            / SECONDS_IN_DAY) as i32;
+        assert_eq!(true, c.is_valid(1)); // "2000-2-2"
+        assert_eq!(date_value, c.value(1));
+
+        // test invalid inputs
+        assert_eq!(false, c.is_valid(2)); // "2000-00-00"
+        assert_eq!(false, c.is_valid(3)); // "2000-01-01T12:00:00"
+        assert_eq!(false, c.is_valid(4)); // "2000"
+    }
+
+    #[test]
     fn test_can_cast_types() {
         // this function attempts to ensure that can_cast_types stays
         // in sync with cast.  It simply tries all combinations of
@@ -2726,14 +2800,14 @@ mod tests {
                     (Ok(_), false) => {
                         panic!("Was able to cast array from {:?} to {:?} but can_cast_types reported false",
                                array.data_type(), to_type)
-                    },
+                    }
                     (Err(e), true) => {
                         panic!("Was not able to cast array from {:?} to {:?} but can_cast_types reported true. \
                                 Error was {:?}",
                                array.data_type(), to_type, e)
-                    },
+                    }
                     // otherwise it was a match
-                    _=> {},
+                    _ => {}
                 };
             }
         }
@@ -2841,10 +2915,10 @@ mod tests {
         // Construct a list array from the above two
         let list_data_type =
             DataType::List(Box::new(Field::new("item", DataType::Int32, true)));
-        let list_data = ArrayData::builder(list_data_type.clone())
+        let list_data = ArrayData::builder(list_data_type)
             .len(3)
-            .add_buffer(value_offsets.clone())
-            .add_child_data(value_data.clone())
+            .add_buffer(value_offsets)
+            .add_child_data(value_data)
             .build();
         ListArray::from(list_data)
     }
@@ -2863,10 +2937,10 @@ mod tests {
         // Construct a list array from the above two
         let list_data_type =
             DataType::LargeList(Box::new(Field::new("item", DataType::Int32, true)));
-        let list_data = ArrayData::builder(list_data_type.clone())
+        let list_data = ArrayData::builder(list_data_type)
             .len(3)
-            .add_buffer(value_offsets.clone())
-            .add_child_data(value_data.clone())
+            .add_buffer(value_offsets)
+            .add_child_data(value_data)
             .build();
         LargeListArray::from(list_data)
     }
@@ -2887,7 +2961,7 @@ mod tests {
         );
         let list_data = ArrayData::builder(list_data_type)
             .len(5)
-            .add_child_data(value_data.clone())
+            .add_child_data(value_data)
             .build();
         FixedSizeListArray::from(list_data)
     }
@@ -2957,10 +3031,8 @@ mod tests {
             Timestamp(TimeUnit::Second, Some(tz_name.clone())),
             Timestamp(TimeUnit::Millisecond, Some(tz_name.clone())),
             Timestamp(TimeUnit::Microsecond, Some(tz_name.clone())),
-            Timestamp(TimeUnit::Nanosecond, Some(tz_name.clone())),
+            Timestamp(TimeUnit::Nanosecond, Some(tz_name)),
             Date32(DateUnit::Day),
-            Date64(DateUnit::Day),
-            Date32(DateUnit::Millisecond),
             Date64(DateUnit::Millisecond),
             Time32(TimeUnit::Second),
             Time32(TimeUnit::Millisecond),

@@ -54,7 +54,7 @@ add_custom_command(OUTPUT ${FLIGHT_GENERATED_PROTO_FILES}
                    COMMAND ${ARROW_PROTOBUF_PROTOC}
                            "-I${FLIGHT_PROTO_PATH}"
                            "--grpc_out=${CMAKE_CURRENT_BINARY_DIR}"
-                           "--plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}"
+                           "--plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>"
                            "${FLIGHT_PROTO}")
 
 set_source_files_properties(${FLIGHT_GENERATED_PROTO_FILES} PROPERTIES GENERATED TRUE)
@@ -118,6 +118,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS_BACKUP}")
 # protobuf-internal.cc
 set(ARROW_FLIGHT_SRCS
     client.cc
+    client_cookie_middleware.cc
+    client_header_internal.cc
     internal.cc
     protocol_internal.cc
     serialization_internal.cc

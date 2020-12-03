@@ -128,11 +128,14 @@ impl ExecutionPlan for CustomExecutionPlan {
 }
 
 impl TableProvider for CustomTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn schema(&self) -> SchemaRef {
         TEST_CUSTOM_SCHEMA_REF!()
     }
 
-    /// Create an ExecutionPlan that will scan the table.
     fn scan(
         &self,
         projection: &Option<Vec<usize>>,
@@ -164,9 +167,9 @@ async fn custom_source_dataframe() -> Result<()> {
                 assert_eq!(table_schema.fields().len(), 2);
                 assert_eq!(projected_schema.fields().len(), 1);
             }
-            _ => assert!(false, "input to projection should be TableScan"),
+            _ => panic!("input to projection should be TableScan"),
         },
-        _ => assert!(false, "expect optimized_plan to be projection"),
+        _ => panic!("expect optimized_plan to be projection"),
     }
 
     let expected = "Projection: #c2\

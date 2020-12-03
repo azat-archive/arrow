@@ -761,6 +761,16 @@ def test_large_binary_value(ty):
     assert len(buf) == len(s) * nrepeats
 
 
+@pytest.mark.large_memory
+@pytest.mark.parametrize("ty", [pa.binary(), pa.string()])
+def test_string_too_large(ty):
+    # Construct a binary array with a single value larger than 4GB
+    s = b"0123456789abcdefghijklmnopqrstuvwxyz"
+    nrepeats = math.ceil((2**32 + 5) / len(s))
+    with pytest.raises(pa.ArrowCapacityError):
+        pa.array([b"foo", s * nrepeats, None, b"bar"], type=ty)
+
+
 def test_sequence_bytes():
     u1 = b'ma\xc3\xb1ana'
 
@@ -1471,10 +1481,9 @@ def test_sequence_decimal_large_integer():
 def test_sequence_decimal_from_integers():
     data = [0, 1, -39402950693754869342983]
     expected = [decimal.Decimal(x) for x in data]
-    # TODO: update this test after scaling implementation.
-    type = pa.decimal128(precision=28, scale=5)
-    arr = pa.array(data, type=type)
-    assert arr.to_pylist() == expected
+    for type in [pa.decimal128, pa.decimal256]:
+        arr = pa.array(data, type=type(precision=28, scale=5))
+        assert arr.to_pylist() == expected
 
 
 def test_sequence_decimal_too_high_precision():

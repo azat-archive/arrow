@@ -225,24 +225,34 @@ def test_sum_chunked_array(arrow_type):
 def test_mode_array():
     # ARROW-9917
     arr = pa.array([1, 1, 3, 4, 3, 5], type='int64')
-    expected = {"mode": 1, "count": 2}
-    assert pc.mode(arr).as_py() == {"mode": 1, "count": 2}
+    mode = pc.mode(arr)
+    assert len(mode) == 1
+    assert mode[0].as_py() == {"mode": 1, "count": 2}
+
+    mode = pc.mode(arr, 2)
+    assert len(mode) == 2
+    assert mode[0].as_py() == {"mode": 1, "count": 2}
+    assert mode[1].as_py() == {"mode": 3, "count": 2}
 
     arr = pa.array([], type='int64')
-    expected = {"mode": None, "count": None}
-    assert pc.mode(arr).as_py() == expected
+    assert len(pc.mode(arr)) == 0
 
 
 def test_mode_chunked_array():
     # ARROW-9917
     arr = pa.chunked_array([pa.array([1, 1, 3, 4, 3, 5], type='int64')])
-    expected = {"mode": 1, "count": 2}
-    assert pc.mode(arr).as_py() == expected
+    mode = pc.mode(arr)
+    assert len(mode) == 1
+    assert mode[0].as_py() == {"mode": 1, "count": 2}
+
+    mode = pc.mode(arr, 2)
+    assert len(mode) == 2
+    assert mode[0].as_py() == {"mode": 1, "count": 2}
+    assert mode[1].as_py() == {"mode": 3, "count": 2}
 
     arr = pa.chunked_array((), type='int64')
-    expected = {"mode": None, "count": None}
     assert arr.num_chunks == 0
-    assert pc.mode(arr).as_py() == expected
+    assert len(pc.mode(arr)) == 0
 
 
 def test_variance():
@@ -338,6 +348,34 @@ def test_min_max():
             TypeError,
             match=r"min_max\(\) missing 1 required positional argument"):
         s = pc.min_max()
+
+
+def test_any():
+    # ARROW-1846
+    a = pa.array([False, None, True])
+    assert pc.any(a).as_py() is True
+
+    a = pa.array([False, None, False])
+    assert pc.any(a).as_py() is False
+
+
+def test_all():
+    # ARROW-10301
+
+    a = pa.array([], type='bool')
+    assert pc.all(a).as_py() is True
+
+    a = pa.array([False, True])
+    assert pc.all(a).as_py() is False
+
+    a = pa.array([True, None])
+    assert pc.all(a).as_py() is True
+
+    a = pa.chunked_array([[True], [True, None]])
+    assert pc.all(a).as_py() is True
+
+    a = pa.chunked_array([[True], [False]])
+    assert pc.all(a).as_py() is False
 
 
 def test_is_valid():
@@ -858,6 +896,16 @@ def test_fill_null():
     fill_value = pa.scalar(None, type=pa.null())
     result = arr.fill_null(fill_value)
     expected = pa.array([None, None, None, None])
+    assert result.equals(expected)
+
+    arr = pa.array(['a', 'bb', None])
+    result = arr.fill_null('ccc')
+    expected = pa.array(['a', 'bb', 'ccc'])
+    assert result.equals(expected)
+
+    arr = pa.array([b'a', b'bb', None], type=pa.large_binary())
+    result = arr.fill_null('ccc')
+    expected = pa.array([b'a', b'bb', b'ccc'], type=pa.large_binary())
     assert result.equals(expected)
 
 

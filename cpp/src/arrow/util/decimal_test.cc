@@ -40,6 +40,9 @@ namespace arrow {
 using internal::int128_t;
 using internal::uint128_t;
 
+static const int128_t kInt128Max =
+    (static_cast<int128_t>(INT64_MAX) << 64) + static_cast<int128_t>(UINT64_MAX);
+
 class DecimalTestFixture : public ::testing::Test {
  public:
   DecimalTestFixture() : integer_value_(23423445), string_value_("234.23445") {}
@@ -894,7 +897,8 @@ TEST(Decimal128Test, TestToInteger) {
 template <typename ArrowType, typename CType = typename ArrowType::c_type>
 std::vector<CType> GetRandomNumbers(int32_t size) {
   auto rand = random::RandomArrayGenerator(0x5487655);
-  auto x_array = rand.Numeric<ArrowType>(size, 0, std::numeric_limits<CType>::max(), 0);
+  auto x_array = rand.Numeric<ArrowType>(size, static_cast<CType>(0),
+                                         std::numeric_limits<CType>::max(), 0);
 
   auto x_ptr = x_array->data()->template GetValues<CType>(1);
   std::vector<CType> ret;
@@ -978,6 +982,39 @@ TEST(Decimal128Test, Divide) {
       Decimal128 result = decimal_x / decimal_y;
       EXPECT_EQ(Decimal128FromInt128(x / y), result)
           << " x: " << decimal_x << " y: " << decimal_y;
+    }
+  }
+}
+
+TEST(Decimal128Test, Rescale) {
+  ASSERT_OK_AND_EQ(Decimal128(11100), Decimal128(111).Rescale(0, 2));
+  ASSERT_OK_AND_EQ(Decimal128(111), Decimal128(11100).Rescale(2, 0));
+  ASSERT_OK_AND_EQ(Decimal128(5), Decimal128(500000).Rescale(6, 1));
+  ASSERT_OK_AND_EQ(Decimal128(500000), Decimal128(5).Rescale(1, 6));
+  ASSERT_RAISES(Invalid, Decimal128(555555).Rescale(6, 1));
+
+  // Test some random numbers.
+  for (auto original_scale : GetRandomNumbers<Int16Type>(16)) {
+    for (auto value : GetRandomNumbers<Int32Type>(16)) {
+      Decimal128 unscaled_value = Decimal128(value);
+      Decimal128 scaled_value = unscaled_value;
+      for (int32_t new_scale = original_scale; new_scale < original_scale + 29;
+           new_scale++, scaled_value *= Decimal128(10)) {
+        ASSERT_OK_AND_EQ(scaled_value, unscaled_value.Rescale(original_scale, new_scale));
+        ASSERT_OK_AND_EQ(unscaled_value, scaled_value.Rescale(new_scale, original_scale));
+      }
+    }
+  }
+
+  for (auto original_scale : GetRandomNumbers<Int16Type>(16)) {
+    Decimal128 value(1);
+    for (int32_t new_scale = original_scale; new_scale < original_scale + 39;
+         new_scale++, value *= Decimal128(10)) {
+      Decimal128 negative_value = value * -1;
+      ASSERT_OK_AND_EQ(value, Decimal128(1).Rescale(original_scale, new_scale));
+      ASSERT_OK_AND_EQ(negative_value, Decimal128(-1).Rescale(original_scale, new_scale));
+      ASSERT_OK_AND_EQ(Decimal128(1), value.Rescale(new_scale, original_scale));
+      ASSERT_OK_AND_EQ(Decimal128(-1), negative_value.Rescale(new_scale, original_scale));
     }
   }
 }
@@ -1292,6 +1329,92 @@ TEST(Decimal256Test, Multiply) {
       Decimal256 result = decimal_x * decimal_y;
       EXPECT_EQ(Decimal256FromInt128(x * y), result)
           << " x: " << decimal_x << " y: " << decimal_y;
+    }
+  }
+}
+
+TEST(Decimal256Test, Divide) {
+  ASSERT_EQ(Decimal256(33), Decimal256(100) / Decimal256(3));
+  ASSERT_EQ(Decimal256(66), Decimal256(200) / Decimal256(3));
+  ASSERT_EQ(Decimal256(66), Decimal256(20100) / Decimal256(301));
+  ASSERT_EQ(Decimal256(-66), Decimal256(-20100) / Decimal256(301));
+  ASSERT_EQ(Decimal256(-66), Decimal256(20100) / Decimal256(-301));
+  ASSERT_EQ(Decimal256(66), Decimal256(-20100) / Decimal256(-301));
+  ASSERT_EQ(Decimal256("-5192296858534827628530496329343552"),
+            Decimal256("-269599466671506397946670150910580797473777870509761363"
+                       "24636208709184") /
+                Decimal256("5192296858534827628530496329874417"));
+  ASSERT_EQ(Decimal256("5192296858534827628530496329343552"),
+            Decimal256("-269599466671506397946670150910580797473777870509761363"
+                       "24636208709184") /
+                Decimal256("-5192296858534827628530496329874417"));
+  ASSERT_EQ(Decimal256("5192296858534827628530496329343552"),
+            Decimal256("2695994666715063979466701509105807974737778705097613632"
+                       "4636208709184") /
+                Decimal256("5192296858534827628530496329874417"));
+  ASSERT_EQ(Decimal256("-5192296858534827628530496329343552"),
+            Decimal256("2695994666715063979466701509105807974737778705097613632"
+                       "4636208709184") /
+                Decimal256("-5192296858534827628530496329874417"));
+
+  // Test some random numbers.
+  for (auto x : GetRandomNumbers<Int32Type>(16)) {
+    for (auto y : GetRandomNumbers<Int32Type>(16)) {
+      if (y == 0) {
+        continue;
+      }
+
+      Decimal256 result = Decimal256(x) / Decimal256(y);
+      ASSERT_EQ(Decimal256(static_cast<int64_t>(x) / y), result)
+          << " x: " << x << " y: " << y;
+    }
+  }
+
+  // Test some edge cases
+  for (auto x :
+       std::vector<int128_t>{-kInt128Max, -INT64_MAX - 1, -INT64_MAX, -INT32_MAX - 1,
+                             -INT32_MAX, 0, INT32_MAX, INT64_MAX, kInt128Max}) {
+    for (auto y : std::vector<int128_t>{-INT64_MAX - 1, -INT64_MAX, -INT32_MAX, -32, -2,
+                                        -1, 1, 2, 32, INT32_MAX, INT64_MAX}) {
+      Decimal256 decimal_x = Decimal256FromInt128(x);
+      Decimal256 decimal_y = Decimal256FromInt128(y);
+      Decimal256 result = decimal_x / decimal_y;
+      EXPECT_EQ(Decimal256FromInt128(x / y), result)
+          << " x: " << decimal_x.ToIntegerString()
+          << " y: " << decimal_y.ToIntegerString();
+    }
+  }
+}
+
+TEST(Decimal256Test, Rescale) {
+  ASSERT_OK_AND_EQ(Decimal256(11100), Decimal256(111).Rescale(0, 2));
+  ASSERT_OK_AND_EQ(Decimal256(111), Decimal256(11100).Rescale(2, 0));
+  ASSERT_OK_AND_EQ(Decimal256(5), Decimal256(500000).Rescale(6, 1));
+  ASSERT_OK_AND_EQ(Decimal256(500000), Decimal256(5).Rescale(1, 6));
+  ASSERT_RAISES(Invalid, Decimal256(555555).Rescale(6, 1));
+
+  // Test some random numbers.
+  for (auto original_scale : GetRandomNumbers<Int16Type>(16)) {
+    for (auto value : GetRandomNumbers<Int32Type>(16)) {
+      Decimal256 unscaled_value = Decimal256(value);
+      Decimal256 scaled_value = unscaled_value;
+      for (int32_t new_scale = original_scale; new_scale < original_scale + 68;
+           new_scale++, scaled_value *= Decimal256(10)) {
+        ASSERT_OK_AND_EQ(scaled_value, unscaled_value.Rescale(original_scale, new_scale));
+        ASSERT_OK_AND_EQ(unscaled_value, scaled_value.Rescale(new_scale, original_scale));
+      }
+    }
+  }
+
+  for (auto original_scale : GetRandomNumbers<Int16Type>(16)) {
+    Decimal256 value(1);
+    for (int32_t new_scale = original_scale; new_scale < original_scale + 77;
+         new_scale++, value *= Decimal256(10)) {
+      Decimal256 negative_value = value * -1;
+      ASSERT_OK_AND_EQ(value, Decimal256(1).Rescale(original_scale, new_scale));
+      ASSERT_OK_AND_EQ(negative_value, Decimal256(-1).Rescale(original_scale, new_scale));
+      ASSERT_OK_AND_EQ(Decimal256(1), value.Rescale(new_scale, original_scale));
+      ASSERT_OK_AND_EQ(Decimal256(-1), negative_value.Rescale(new_scale, original_scale));
     }
   }
 }

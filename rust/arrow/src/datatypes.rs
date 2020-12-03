@@ -145,6 +145,8 @@ pub enum DataType {
     /// This type mostly used to represent low cardinality string
     /// arrays or a limited set of primitive types as integers.
     Dictionary(Box<DataType>, Box<DataType>),
+    /// Decimal value with precision and scale
+    Decimal(usize, usize),
 }
 
 /// Date is either a 32-bit or 64-bit type representing elapsed time since UNIX
@@ -873,7 +875,7 @@ impl<T: ArrowNativeType> ToByteSlice for T {
 
 impl DataType {
     /// Parse a data type from a JSON representation
-    fn from(json: &Value) -> Result<DataType> {
+    pub(crate) fn from(json: &Value) -> Result<DataType> {
         let default_field = Field::new("", DataType::Boolean, true);
         match *json {
             Value::Object(ref map) => match map.get("name") {
@@ -1122,17 +1124,28 @@ impl DataType {
                 TimeUnit::Nanosecond => "NANOSECOND",
             }}),
             DataType::Dictionary(_, _) => json!({ "name": "dictionary"}),
+            DataType::Decimal(precision, scale) => {
+                json!({"name": "decimal", "precision": precision, "scale": scale})
+            }
         }
     }
 
     /// Returns true if this type is numeric: (UInt*, Unit*, or Float*)
     pub fn is_numeric(t: &DataType) -> bool {
         use DataType::*;
-        match t {
-            UInt8 | UInt16 | UInt32 | UInt64 | Int8 | Int16 | Int32 | Int64 | Float32
-            | Float64 => true,
-            _ => false,
-        }
+        matches!(
+            t,
+            UInt8
+                | UInt16
+                | UInt32
+                | UInt64
+                | Int8
+                | Int16
+                | Int32
+                | Int64
+                | Float32
+                | Float64
+        )
     }
 }
 
@@ -1183,16 +1196,22 @@ impl Field {
         self.nullable
     }
 
-    /// Returns the dictionary ID
+    /// Returns the dictionary ID, if this is a dictionary type
     #[inline]
-    pub const fn dict_id(&self) -> i64 {
-        self.dict_id
+    pub const fn dict_id(&self) -> Option<i64> {
+        match self.data_type {
+            DataType::Dictionary(_, _) => Some(self.dict_id),
+            _ => None,
+        }
     }
 
-    /// Indicates whether this `Field`'s dictionary is ordered
+    /// Returns whether this `Field`'s dictionary is ordered, if this is a dictionary type
     #[inline]
-    pub const fn dict_is_ordered(&self) -> bool {
-        self.dict_is_ordered
+    pub const fn dict_is_ordered(&self) -> Option<bool> {
+        match self.data_type {
+            DataType::Dictionary(_, _) => Some(self.dict_is_ordered),
+            _ => None,
+        }
     }
 
     /// Parse a `Field` definition from a JSON representation
@@ -1458,7 +1477,8 @@ impl Field {
             | DataType::FixedSizeList(_, _)
             | DataType::FixedSizeBinary(_)
             | DataType::Utf8
-            | DataType::LargeUtf8 => {
+            | DataType::LargeUtf8
+            | DataType::Decimal(_, _) => {
                 if self.data_type != from.data_type {
                     return Err(ArrowError::SchemaError(
                         "Fail to merge schema Field due to conflicting datatype"
@@ -1489,7 +1509,7 @@ impl fmt::Display for Field {
 pub struct Schema {
     pub(crate) fields: Vec<Field>,
     /// A map of key-value pairs containing additional meta data.
-    #[serde(default)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub(crate) metadata: HashMap<String, String>,
 }
 
@@ -1628,6 +1648,15 @@ impl Schema {
         Ok(&self.fields[self.index_of(name)?])
     }
 
+    /// Returns a vector of immutable references to all `Field` instances selected by
+    /// the dictionary ID they use
+    pub fn fields_with_dict_id(&self, dict_id: i64) -> Vec<&Field> {
+        self.fields
+            .iter()
+            .filter(|f| f.dict_id() == Some(dict_id))
+            .collect()
+    }
+
     /// Find the index of the column with the given name
     pub fn index_of(&self, name: &str) -> Result<usize> {
         for i in 0..self.fields.len() {
@@ -1696,9 +1725,24 @@ impl Schema {
     }
 
     /// Parse a `metadata` definition from a JSON representation
+    /// The JSON can either be an Object or an Array of Objects
     fn from_metadata(json: &Value) -> Result<HashMap<String, String>> {
-        if let Value::Object(md) = json {
-            md.iter()
+        match json {
+            Value::Array(_) => {
+                let mut hashmap = HashMap::new();
+                let values: Vec<MetadataKeyValue> = serde_json::from_value(json.clone())
+                    .map_err(|_| {
+                        ArrowError::JsonError(
+                            "Unable to parse object into key-value pair".to_string(),
+                        )
+                    })?;
+                for meta in values {
+                    hashmap.insert(meta.key.clone(), meta.value);
+                }
+                Ok(hashmap)
+            }
+            Value::Object(md) => md
+                .iter()
                 .map(|(k, v)| {
                     if let Value::String(v) = v {
                         Ok((k.to_string(), v.to_string()))
@@ -1708,11 +1752,10 @@ impl Schema {
                         ))
                     }
                 })
-                .collect::<Result<_>>()
-        } else {
-            Err(ArrowError::ParseError(
+                .collect::<Result<_>>(),
+            _ => Err(ArrowError::ParseError(
                 "`metadata` field must be an object".to_string(),
-            ))
+            )),
         }
     }
 }
@@ -1733,6 +1776,11 @@ impl fmt::Display for Schema {
 /// A reference-counted reference to a [`Schema`](crate::datatypes::Schema).
 pub type SchemaRef = Arc<Schema>;
 
+#[derive(Deserialize)]
+struct MetadataKeyValue {
+    key: String,
+    value: String,
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2479,7 +2527,8 @@ mod tests {
         last_name: Utf8, \
         address: Struct([\
         Field { name: \"street\", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false }, \
-        Field { name: \"zip\", data_type: UInt16, nullable: false, dict_id: 0, dict_is_ordered: false }])")
+        Field { name: \"zip\", data_type: UInt16, nullable: false, dict_id: 0, dict_is_ordered: false }]), \
+        interests: Dictionary(Int32, Utf8)")
     }
 
     #[test]
@@ -2487,18 +2536,29 @@ mod tests {
         let schema = person_schema();
 
         // test schema accessors
-        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.fields().len(), 4);
 
         // test field accessors
         let first_name = &schema.fields()[0];
         assert_eq!(first_name.name(), "first_name");
         assert_eq!(first_name.data_type(), &DataType::Utf8);
         assert_eq!(first_name.is_nullable(), false);
+        assert_eq!(first_name.dict_id(), None);
+        assert_eq!(first_name.dict_is_ordered(), None);
+
+        let interests = &schema.fields()[3];
+        assert_eq!(interests.name(), "interests");
+        assert_eq!(
+            interests.data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        );
+        assert_eq!(interests.dict_id(), Some(123));
+        assert_eq!(interests.dict_is_ordered(), Some(true));
     }
 
     #[test]
     #[should_panic(
-        expected = "Unable to get field named \\\"nickname\\\". Valid fields: [\\\"first_name\\\", \\\"last_name\\\", \\\"address\\\"]"
+        expected = "Unable to get field named \\\"nickname\\\". Valid fields: [\\\"first_name\\\", \\\"last_name\\\", \\\"address\\\", \\\"interests\\\"]"
     )]
     fn schema_index_of() {
         let schema = person_schema();
@@ -2509,7 +2569,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "Unable to get field named \\\"nickname\\\". Valid fields: [\\\"first_name\\\", \\\"last_name\\\", \\\"address\\\"]"
+        expected = "Unable to get field named \\\"nickname\\\". Valid fields: [\\\"first_name\\\", \\\"last_name\\\", \\\"address\\\", \\\"interests\\\"]"
     )]
     fn schema_field_with_name() {
         let schema = person_schema();
@@ -2522,6 +2582,20 @@ mod tests {
             "last_name"
         );
         schema.field_with_name("nickname").unwrap();
+    }
+
+    #[test]
+    fn schema_field_with_dict_id() {
+        let schema = person_schema();
+
+        let fields_dict_123: Vec<_> = schema
+            .fields_with_dict_id(123)
+            .iter()
+            .map(|f| f.name())
+            .collect();
+        assert_eq!(fields_dict_123, vec!["interests"]);
+
+        assert!(schema.fields_with_dict_id(456).is_empty());
     }
 
     #[test]
@@ -2567,7 +2641,7 @@ mod tests {
         assert_eq!(Some(VNumber(Number::from(1))), 1u32.into_json_value());
         assert_eq!(Some(VNumber(Number::from(1))), 1u64.into_json_value());
         assert_eq!(
-            Some(VNumber(Number::from_f64(0.01 as f64).unwrap())),
+            Some(VNumber(Number::from_f64(0.01f64).unwrap())),
             0.01.into_json_value()
         );
         assert_eq!(
@@ -2588,6 +2662,13 @@ mod tests {
                     Field::new("zip", DataType::UInt16, false),
                 ]),
                 false,
+            ),
+            Field::new_dict(
+                "interests",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+                123,
+                true,
             ),
         ])
     }

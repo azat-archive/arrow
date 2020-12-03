@@ -19,7 +19,6 @@ use std::any::Any;
 use std::borrow::Borrow;
 use std::convert::From;
 use std::fmt;
-use std::io::Write;
 use std::iter::{FromIterator, IntoIterator};
 use std::mem;
 use std::sync::Arc;
@@ -309,9 +308,9 @@ impl<T: ArrowPrimitiveType, Ptr: Borrow<Option<<T as ArrowPrimitiveType>::Native
         iter.enumerate().for_each(|(i, item)| {
             if let Some(a) = item.borrow() {
                 bit_util::set_bit(null_slice, i);
-                val_buf.write_all(a.to_byte_slice()).unwrap();
+                val_buf.extend_from_slice(a.to_byte_slice());
             } else {
-                val_buf.write_all(&null).unwrap();
+                val_buf.extend_from_slice(&null);
             }
         });
 
@@ -406,11 +405,9 @@ impl<T: ArrowTimestampType> PrimitiveArray<T> {
             for (i, v) in data.iter().enumerate() {
                 if let Some(n) = v {
                     bit_util::set_bit(null_slice, i);
-                    // unwrap() in the following should be safe here since we've
-                    // made sure enough space is allocated for the values.
-                    val_buf.write_all(&n.to_byte_slice()).unwrap();
+                    val_buf.extend_from_slice(&n.to_byte_slice());
                 } else {
-                    val_buf.write_all(&null).unwrap();
+                    val_buf.extend_from_slice(&null);
                 }
             }
         }
@@ -592,12 +589,12 @@ mod tests {
         assert_eq!(0, arr.offset());
         assert_eq!(0, arr.null_count());
         let formatted = vec!["00:00:00.001", "10:30:00.005", "23:59:59.210"];
-        for i in 0..3 {
+        for (i, formatted) in formatted.iter().enumerate().take(3) {
             // check that we can't create dates or datetimes from time instances
             assert_eq!(None, arr.value_as_datetime(i));
             assert_eq!(None, arr.value_as_date(i));
             let time = arr.value_as_time(i).unwrap();
-            assert_eq!(formatted[i], time.format("%H:%M:%S%.3f").to_string());
+            assert_eq!(*formatted, time.format("%H:%M:%S%.3f").to_string());
         }
     }
 
@@ -616,12 +613,12 @@ mod tests {
         assert_eq!(0, arr.offset());
         assert_eq!(0, arr.null_count());
         let formatted = vec!["00:00:00.001", "10:30:00.005", "23:59:59.210"];
-        for i in 0..3 {
+        for (i, item) in formatted.iter().enumerate().take(3) {
             // check that we can't create dates or datetimes from time instances
             assert_eq!(None, arr.value_as_datetime(i));
             assert_eq!(None, arr.value_as_date(i));
             let time = arr.value_as_time(i).unwrap();
-            assert_eq!(formatted[i], time.format("%H:%M:%S%.3f").to_string());
+            assert_eq!(*item, time.format("%H:%M:%S%.3f").to_string());
         }
     }
 
