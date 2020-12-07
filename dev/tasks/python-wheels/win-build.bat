@@ -26,11 +26,11 @@
 call conda.bat create -n wheel-build -q -y -c conda-forge ^
     --file=arrow\ci\conda_env_cpp.yml ^
     --file=arrow\ci\conda_env_python.yml ^
-    "vs2015_runtime<14.16" ^
     python=%PYTHON_VERSION% || exit /B
 
 call conda.bat activate wheel-build
 
+set CONDA_PREFIX_CMAKE_STYLE=%CONDA_PREFIX:\=/%
 set ARROW_HOME=%CONDA_PREFIX%\Library
 set PARQUET_HOME=%CONDA_PREFIX%\Library
 echo %ARROW_HOME%
@@ -44,34 +44,31 @@ pushd arrow\cpp\build
 @rem conda-forge also results in a broken build so we use the BUNDLED
 @rem dependency resolution strategy for now
 
+@rem -DARROW_DEPENDENCY_SOURCE=BUNDLED is required because recent
+@rem conda-forge packages don't provide static library.
 cmake -A "%ARCH%" ^
       -G "%GENERATOR%" ^
-      -DCMAKE_INSTALL_PREFIX=%ARROW_HOME% ^
-      -DARROW_BOOST_USE_SHARED=OFF ^
       -DARROW_BUILD_STATIC=OFF ^
       -DARROW_BUILD_TESTS=OFF ^
-      -DCMAKE_BUILD_TYPE=Release ^
-      -DARROW_DEPENDENCY_SOURCE=CONDA ^
-      -DOPENSSL_ROOT_DIR=%CONDA_PREFIX%/Library ^
       -DARROW_CXXFLAGS="/MP" ^
-      -DARROW_WITH_BZ2=OFF ^
-      -DARROW_WITH_ZLIB=ON ^
-      -DARROW_WITH_ZSTD=ON ^
-      -DARROW_WITH_LZ4=ON ^
-      -DARROW_WITH_SNAPPY=ON ^
-      -DARROW_WITH_BROTLI=ON ^
       -DARROW_DATASET=ON ^
+      -DARROW_DEPENDENCY_SOURCE=BUNDLED ^
       -DARROW_FLIGHT=ON ^
       -DARROW_GANDIVA=OFF ^
-      -DARROW_LZ4_USE_SHARED=OFF ^
       -DARROW_MIMALLOC=ON ^
+      -DARROW_OPENSSL_USE_SHARED=OFF ^
+      -DARROW_PROTOBUF_USE_SHARED=OFF ^
       -DARROW_PARQUET=ON ^
       -DARROW_PYTHON=ON ^
-      -DARROW_SNAPPY_USE_SHARED=OFF ^
-      -DARROW_VERBOSE_THIRDPARTY_BUILD=ON ^
-      -DBrotli_SOURCE=BUNDLED ^
-      -Dzstd_SOURCE=BUNDLED ^
-      -Dutf8proc_SOURCE=BUNDLED ^
+      -DARROW_WITH_BROTLI=ON ^
+      -DARROW_WITH_BZ2=OFF ^
+      -DARROW_WITH_LZ4=ON ^
+      -DARROW_WITH_SNAPPY=ON ^
+      -DARROW_WITH_ZLIB=ON ^
+      -DARROW_WITH_ZSTD=ON ^
+      -DCMAKE_BUILD_TYPE=Release ^
+      -DCMAKE_INSTALL_PREFIX=%ARROW_HOME% ^
+      -DOPENSSL_ROOT_DIR=%CONDA_PREFIX_CMAKE_STYLE%/Library ^
       .. || exit /B
 cmake ^
   --build . ^
@@ -114,6 +111,6 @@ python -c "import pyarrow.flight" || exit /B
 python -c "import pyarrow.dataset" || exit /B
 
 @rem run the python tests, but disable the cython because there is a linking
-@rem issue on python 3.8
+@rem issue on python 3.9
 set PYARROW_TEST_CYTHON=OFF
 python -m pytest -rs --pyargs pyarrow || exit /B
